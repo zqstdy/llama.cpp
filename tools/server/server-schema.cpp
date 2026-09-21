@@ -513,6 +513,62 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("logit_gate"))
+        ->set_desc("Single-pass decision gate over the last prompt token's logits, before any decoding. "
+                   "Format: {candidates: [{label, text | ids}], mode: \"gate_only\" (default) | \"gate_then_chat\", threshold: 0..1}. "
+                   "'text' must tokenize to exactly one token; 'ids' takes explicit token ids (probability mass is summed). "
+                   "gate_only always returns the distribution and stops; gate_then_chat falls through to normal generation when best prob < threshold")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & g = data.at("logit_gate");
+            if (!g.is_object()) {
+                throw std::invalid_argument("logit_gate must be an object");
+            }
+            if (!g.contains("candidates") || !g.at("candidates").is_array() || g.at("candidates").empty()) {
+                throw std::invalid_argument("logit_gate.candidates must be a non-empty array");
+            }
+            const int n_vocab = llama_vocab_n_tokens(ctx.vocab);
+            for (const auto & c : g.at("candidates")) {
+                server_logit_gate_candidate out;
+                out.label = c.at("label").get<std::string>();
+                if (out.label.empty()) {
+                    throw std::invalid_argument("logit_gate candidate label must not be empty");
+                }
+                if (c.contains("ids") && !c.at("ids").is_null()) {
+                    for (const auto & id : c.at("ids")) {
+                        llama_token t = id.get<llama_token>();
+                        if (t < 0 || t >= n_vocab) {
+                            throw std::invalid_argument(string_format("logit_gate candidate '%s': token id %d out of range (n_vocab = %d)",
+                                out.label.c_str(), t, n_vocab));
+                        }
+                        out.ids.push_back(t);
+                    }
+                    if (out.ids.empty()) {
+                        throw std::invalid_argument(string_format("logit_gate candidate '%s': ids must not be empty", out.label.c_str()));
+                    }
+                } else if (c.contains("text") && !c.at("text").is_null()) {
+                    llama_tokens toks = common_tokenize(ctx.vocab, c.at("text").get<std::string>(), false);
+                    if (toks.size() != 1) {
+                        throw std::invalid_argument(string_format("logit_gate candidate '%s': text must tokenize to exactly 1 token (got %d); pass ids explicitly for first-token scoring",
+                            out.label.c_str(), (int)toks.size()));
+                    }
+                    out.ids.push_back(toks[0]);
+                } else {
+                    throw std::invalid_argument(string_format("logit_gate candidate '%s' needs either 'text' or 'ids'", out.label.c_str()));
+                }
+                ctx.params.logit_gate.candidates.push_back(std::move(out));
+            }
+            ctx.params.logit_gate.enabled = true;
+            const std::string mode = json_value(g, "mode", std::string("gate_only"));
+            if (mode == "gate_only") {
+                ctx.params.logit_gate.gate_then_chat = false;
+            } else if (mode == "gate_then_chat") {
+                ctx.params.logit_gate.gate_then_chat = true;
+            } else {
+                throw std::invalid_argument("logit_gate.mode must be 'gate_only' or 'gate_then_chat'");
+            }
+            ctx.params.logit_gate.threshold = std::max(0.0f, std::min(1.0f, json_value(g, "threshold", 0.5f)));
+        }));
+
     return fields;
 }
 

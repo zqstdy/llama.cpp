@@ -2225,6 +2225,90 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // logit_gate: classify from the logits of the last prompt token before any
+    // decoding. returns true when the gate produced a result (slot released);
+    // false means fall through to normal generation (gate_then_chat, not fired).
+    bool evaluate_logit_gate(server_slot & slot, const llama_batch & batch_view, int32_t off) {
+        const auto & gate = slot.task->params.logit_gate;
+
+        const int tok_idx = slot.i_batch - off;
+        const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+
+        // softmax over the union of candidate token ids (max-shifted for stability)
+        float max_logit = -INFINITY;
+        for (const auto & c : gate.candidates) {
+            for (llama_token id : c.ids) {
+                max_logit = std::max(max_logit, logits[id]);
+            }
+        }
+        float sum_exp = 0.0f;
+        for (const auto & c : gate.candidates) {
+            for (llama_token id : c.ids) {
+                sum_exp += expf(logits[id] - max_logit);
+            }
+        }
+
+        json distribution = json::array();
+        float best = 0.0f;
+        std::string best_label;
+        for (const auto & c : gate.candidates) {
+            float p = 0.0f;
+            for (llama_token id : c.ids) {
+                p += expf(logits[id] - max_logit);
+            }
+            p /= sum_exp;
+            if (p > best) {
+                best = p;
+                best_label = c.label;
+            }
+            distribution.push_back(json { {"label", c.label}, {"prob", p} });
+        }
+
+        if (gate.gate_then_chat && best < gate.threshold) {
+            return false; // fall through: this request continues as normal generation
+        }
+
+        auto res = std::make_unique<server_task_result_cmpl_final>();
+        res->id      = slot.task->id;
+        res->id_slot = slot.id;
+        res->index   = slot.task->index;
+        res->content = "";
+        res->tokens  = llama_tokens{};
+        res->stats   = slot.stats;
+        res->prompt  = slot.task->tokens.detokenize(ctx_tgt, true);
+        res->response_fields = slot.task->params.response_fields;
+        res->truncated             = false;
+        res->n_decoded             = 0;
+        res->n_prompt_tokens       = slot.task->n_tokens();
+        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+        res->n_tokens_cached       = slot.prompt.n_tokens();
+        res->has_new_line          = false;
+        res->stop                  = STOP_TYPE_NONE;
+        res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+        res->verbose               = slot.task->params.verbose;
+        res->stream                = slot.task->params.stream;
+        res->include_usage         = slot.task->params.include_usage;
+        res->res_type              = slot.task->params.res_type;
+        res->oaicompat_model       = slot.task->params.oaicompat_model;
+        res->oaicompat_cmpl_id     = slot.task->params.oaicompat_cmpl_id;
+        res->generation_params     = slot.task->params;
+        res->logit_gate = json {
+            {"best",         best_label},
+            {"prob",         best},
+            {"fired",        true},
+            {"threshold",    gate.threshold},
+            {"distribution", distribution},
+        };
+
+        SLT_INF(slot, "logit_gate fired: best = '%s' (p = %.4f, mode = %s)\n",
+                best_label.c_str(), best, gate.gate_then_chat ? "gate_then_chat" : "gate_only");
+
+        queue_results.send(std::move(res));
+        slot.release();
+        slot.i_batch = -1;
+        return true;
+    }
+
     //
     // Functions to process the task
     //
@@ -3828,6 +3912,11 @@ private:
                     send_rerank(slot, batch_view);
                     slot.release();
                     slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->params.logit_gate.enabled && evaluate_logit_gate(slot, batch_view, off)) {
+                    // gate produced a decision: result sent, slot already released
                     return;
                 }
 
