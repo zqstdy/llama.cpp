@@ -2234,35 +2234,86 @@ private:
         const int tok_idx = slot.i_batch - off;
         const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
 
+        // non-finite logits (quantization edge cases) would produce NaN
+        // probabilities and an ambiguous empty "best" — reject explicitly
+        for (const auto & c : gate.candidates) {
+            for (llama_token id : c.ids) {
+                if (!std::isfinite(logits[id])) {
+                    send_error(slot, "logit_gate: model produced non-finite logits", ERROR_TYPE_SERVER);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return true;
+                }
+            }
+        }
+
+        // temperature scaling: divide the candidate logits by the temperature so
+        // the returned probabilities are honest. explicit request value wins,
+        // else the model's GGUF metadata "jev.temperature", else 1.0; disabled
+        // entirely by options.temperature_scaling = false
+        float temperature = gate.temperature;
+        if (!gate.temperature_explicit && gate.temperature_scaling) {
+            char tbuf[64] = {0};
+            if (llama_model_meta_val_str(model_tgt, "jev.temperature", tbuf, sizeof(tbuf)) > 0) {
+                try { temperature = std::stof(tbuf); } catch (...) { temperature = gate.temperature; }
+            }
+        }
+        const float temp = (gate.temperature_scaling && temperature > 0.0f) ? temperature : 1.0f;
+        const float scale = 1.0f / temp;
+
         // softmax over the union of candidate token ids (max-shifted for stability)
+        std::vector<float> candidate_lse; // per-candidate log-sum-exp, scaled space
+        candidate_lse.reserve(gate.candidates.size());
         float max_logit = -INFINITY;
         for (const auto & c : gate.candidates) {
             for (llama_token id : c.ids) {
-                max_logit = std::max(max_logit, logits[id]);
+                max_logit = std::max(max_logit, logits[id] * scale);
             }
         }
         float sum_exp = 0.0f;
         for (const auto & c : gate.candidates) {
+            float unnorm = 0.0f;
             for (llama_token id : c.ids) {
-                sum_exp += expf(logits[id] - max_logit);
+                unnorm += expf(logits[id] * scale - max_logit);
             }
+            sum_exp += unnorm;
+            candidate_lse.push_back(max_logit + std::log(unnorm)); // log-sum-exp, temperature-scaled space
         }
 
         json distribution = json::array();
+        json label_logits = json::object();
         float best = 0.0f;
         std::string best_label;
-        for (const auto & c : gate.candidates) {
-            float p = 0.0f;
-            for (llama_token id : c.ids) {
-                p += expf(logits[id] - max_logit);
-            }
-            p /= sum_exp;
+        double entropy = 0.0;
+        for (size_t i = 0; i < gate.candidates.size(); i++) {
+            const auto & c = gate.candidates[i];
+            float p = std::exp(candidate_lse[i] - max_logit - std::log(sum_exp));
             if (p > best) {
                 best = p;
                 best_label = c.label;
             }
+            if (p > 0.0) {
+                entropy -= (double) p * std::log((double) p);
+            }
             distribution.push_back(json { {"label", c.label}, {"prob", p} });
+            if (gate.return_logits) {
+                // raw (un-tempered) logit for temperature fitting: the true
+                // log-sum-exp over the UNSCALED logits. T·LSE(l/T) is not
+                // LSE(l), so this must be computed independently
+                float raw_max = -INFINITY;
+                for (llama_token id : c.ids) {
+                    raw_max = std::max(raw_max, logits[id]);
+                }
+                float raw_sum = 0.0f;
+                for (llama_token id : c.ids) {
+                    raw_sum += expf(logits[id] - raw_max);
+                }
+                label_logits[c.label] = raw_max + std::log(raw_sum);
+            }
         }
+        const double confidence = gate.candidates.size() > 1
+            ? 1.0 - entropy / std::log((double) gate.candidates.size())
+            : 1.0;
 
         if (gate.gate_then_chat && best < gate.threshold) {
             return false; // fall through: this request continues as normal generation
@@ -2297,8 +2348,13 @@ private:
             {"prob",         best},
             {"fired",        true},
             {"threshold",    gate.threshold},
+            {"confidence",   confidence},
+            {"temperature",  temp},
             {"distribution", distribution},
         };
+        if (gate.return_logits) {
+            res->logit_gate["label_logits"] = label_logits;
+        }
 
         SLT_INF(slot, "logit_gate fired: best = '%s' (p = %.4f, mode = %s)\n",
                 best_label.c_str(), best, gate.gate_then_chat ? "gate_then_chat" : "gate_only");

@@ -557,6 +557,19 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 }
                 ctx.params.logit_gate.candidates.push_back(std::move(out));
             }
+            // duplicate labels would make "best" ambiguous; cap keeps the
+            // single-token symbol space (A-Z a-z 0-9) as the practical bound
+            for (size_t i = 0; i < ctx.params.logit_gate.candidates.size(); i++) {
+                for (size_t j = i + 1; j < ctx.params.logit_gate.candidates.size(); j++) {
+                    if (ctx.params.logit_gate.candidates[i].label == ctx.params.logit_gate.candidates[j].label) {
+                        throw std::invalid_argument(string_format("logit_gate: duplicate candidate label '%s'",
+                            ctx.params.logit_gate.candidates[i].label.c_str()));
+                    }
+                }
+            }
+            if (ctx.params.logit_gate.candidates.size() > 256) {
+                throw std::invalid_argument("logit_gate: too many candidates (max 256)");
+            }
             ctx.params.logit_gate.enabled = true;
             const std::string mode = json_value(g, "mode", std::string("gate_only"));
             if (mode == "gate_only") {
@@ -567,6 +580,23 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 throw std::invalid_argument("logit_gate.mode must be 'gate_only' or 'gate_then_chat'");
             }
             ctx.params.logit_gate.threshold = std::max(0.0f, std::min(1.0f, json_value(g, "threshold", 0.5f)));
+            if (g.contains("options") && g.at("options").is_object()) {
+                const auto & o = g.at("options");
+                if (o.contains("temperature") && !o.at("temperature").is_null()) {
+                    const float t = o.at("temperature").get<float>();
+                    if (!(t > 0.0f)) {
+                        throw std::invalid_argument("logit_gate.options.temperature must be > 0");
+                    }
+                    ctx.params.logit_gate.temperature = t;
+                    ctx.params.logit_gate.temperature_explicit = true;
+                }
+                if (o.contains("temperature_scaling") && !o.at("temperature_scaling").is_null()) {
+                    ctx.params.logit_gate.temperature_scaling = o.at("temperature_scaling").get<bool>();
+                }
+                if (o.contains("return_logits") && !o.at("return_logits").is_null()) {
+                    ctx.params.logit_gate.return_logits = o.at("return_logits").get<bool>();
+                }
+            }
         }));
 
     return fields;

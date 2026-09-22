@@ -60,6 +60,14 @@ struct server_logit_gate {
     bool enabled = false;
     bool gate_then_chat = false; // false: always return the distribution; true: only stop when best prob >= threshold
     float threshold = 0.5f;      // fire threshold for gate_then_chat mode
+    // temperature scaling: divide the candidate logits by this so the returned
+    // probabilities are honest (most models are over-confident). explicit value
+    // from the request wins; otherwise the model's GGUF metadata key
+    // "jev.temperature" is used when present; else 1.0 (no scaling)
+    float temperature = 1.0f;
+    bool temperature_explicit = false;
+    bool temperature_scaling = true;  // false: ignore the temperature entirely
+    bool return_logits = false;       // also return the raw label logits (for fitting a temperature)
     std::vector<server_logit_gate_candidate> candidates;
 };
 
